@@ -11,10 +11,12 @@ use crate::App;
 use crate::error::{AppResult, user_error};
 use crate::model::{Channel, Fulfillment, Order, OrderItem, OrderStatus, Product, Shop, ShopStatus, Tracking, now};
 use crate::money::{display_money, format_minor, to_minor};
-use crate::paypal::{CheckoutRequest, PaymentResult};
+use crate::paypal::{CheckoutRequest, CreatedOrder, PaymentResult};
 
 const MAX_QUANTITY: u32 = 99;
 const MAX_LINES: usize = 20;
+const MAX_REQUEST_CHARS: usize = 1000;
+const MAX_PRICE: f64 = 1_000_000.0;
 const STOP_WORDS: &[&str] = &[
     "a", "an", "and", "any", "are", "buy", "can", "do", "does", "find", "for", "from", "get", "have", "i", "in", "is",
     "it", "looking", "me", "my", "need", "of", "on", "or", "please", "show", "some", "something", "that", "the", "to",
@@ -68,7 +70,8 @@ pub fn agent_product(shop: &Shop, product: &Product) -> Value {
         "id": product.id,
         "name": product.name,
         "description": product.description,
-        "price": format_minor(product.price_minor, &shop.currency),
+        "price": (!product.by_quote).then(|| format_minor(product.price_minor, &shop.currency)),
+        "pricing": if product.by_quote { "quote" } else { "fixed" },
         "currency": shop.currency,
         "category": product.category,
         "tags": product.tags,
@@ -107,7 +110,7 @@ pub async fn search_products(app: &App, shop: &Shop, args: SearchArgs, channel: 
     let products = app.store.list_products(&shop.slug).await?;
     let mut scored: Vec<(u32, usize, &Product)> = products
         .iter()
-        .filter(|product| product.in_stock && max_minor.is_none_or(|max| product.price_minor <= max))
+        .filter(|product| product.in_stock && (product.by_quote || max_minor.is_none_or(|max| product.price_minor <= max)))
         .map(|product| {
             let (score, matched) = score_product(product, &tokens);
             (score, matched, product)
@@ -131,6 +134,8 @@ pub async fn search_products(app: &App, shop: &Shop, args: SearchArgs, channel: 
     // Assistants rephrase a failed search several times, so only an explicit report counts as one ask.
     if scored.is_empty() || view["match"] == "some_terms" {
         view["next_step"] = json!("If this shop doesn't sell what the shopper asked for, tell them and call report_unmet_need once, without asking first.");
+    } else if scored.iter().take(limit).any(|(_, _, product)| product.by_quote) {
+        view["next_step"] = json!("Results with pricing \"quote\" have no fixed price, so never state one. Collect the details the shop needs and call request_quote.");
     }
     Ok(view)
 }
@@ -180,6 +185,7 @@ pub async fn shop_info(app: &App, shop: &Shop, channel: Channel) -> AppResult<Va
         "shipping_policy": shop.shipping_policy,
         "returns_policy": shop.returns_policy,
         "payment": "PayPal. The shopper approves each order in PayPal, and funds go to the shop.",
+        "custom_requests": "For custom work or items with no fixed price, use request_quote. The shop replies with a price, and the shopper pays it through PayPal.",
     }))
 }
 
@@ -243,7 +249,9 @@ fn new_reference() -> String {
     format!("WI-{code}")
 }
 
-pub fn agent_order(shop: &Shop, order: &Order) -> Value {
+pub fn agent_order(shop: &Shop, order: &Order, base_url: &str) -> Value {
+    let priced = !matches!(order.status, OrderStatus::AwaitingQuote | OrderStatus::Declined);
+    let money = |minor: i64| priced.then(|| format_minor(minor, &order.currency));
     let mut view = json!({
         "order_reference": order.id,
         "status": order.status,
@@ -252,29 +260,70 @@ pub fn agent_order(shop: &Shop, order: &Order) -> Value {
             "name": item.name,
             "options": item.options,
             "quantity": item.quantity,
-            "unit_price": format_minor(item.unit_minor, &order.currency),
+            "unit_price": money(item.unit_minor),
         })).collect::<Vec<_>>(),
-        "shipping": format_minor(order.shipping_minor, &order.currency),
-        "total": format_minor(order.total_minor, &order.currency),
+        "shipping": money(order.shipping_minor),
+        "total": money(order.total_minor),
         "currency": order.currency,
         "fulfillment": order.fulfillment,
         "tracking": order.tracking,
     });
-    if order.status == OrderStatus::AwaitingPayment {
+    if order.is_quote() {
+        view["request"] = json!(order.request);
+        view["message_from_shop"] = json!(order.quote_note);
+        view["status_url"] = json!(format!("{base_url}/quote/{}/{}", shop.slug, order.id));
+        let step = match order.status {
+            OrderStatus::AwaitingQuote => Some("The shop hasn't set a price yet. Give the shopper status_url so they can follow this request."),
+            OrderStatus::Quoted | OrderStatus::AwaitingPayment => Some("The shop has set a price. Tell the shopper the total and give them status_url, where they can pay with PayPal. Nothing is charged until they approve it there."),
+            OrderStatus::Declined => Some("The shop can't take this request. Pass on message_from_shop if there is one."),
+            _ => None,
+        };
+        if let Some(step) = step {
+            view["next_step"] = json!(step);
+        }
+    } else if order.status == OrderStatus::AwaitingPayment {
         view["approval_url"] = json!(order.approval_url);
+    } else if order.status == OrderStatus::Cancelled {
+        view["next_step"] = json!("This checkout expired before it was approved. Create a new one if the shopper still wants it.");
     }
     view
 }
 
-/// Builds an order from the shop's own catalog. Prices never come from the caller,
-/// so an assistant cannot talk the shop into a different total.
-pub async fn create_checkout(app: &App, shop: &Shop, args: CheckoutArgs, channel: Channel, base_url: &str) -> AppResult<Value> {
+fn ensure_open(shop: &Shop) -> AppResult<()> {
     if shop.status != ShopStatus::Live {
         return Err(user_error(format!("{} is not open for orders yet.", shop.name)));
     }
     if shop.paypal_email.is_empty() {
         return Err(user_error(format!("{} has not connected PayPal yet.", shop.name)));
     }
+    Ok(())
+}
+
+async fn open_checkout(app: &App, shop: &Shop, order: &Order, idempotency_key: String, base_url: &str) -> AppResult<CreatedOrder> {
+    let query = format!("shop={}&ref={}", shop.slug, order.id);
+    app.paypal
+        .create_order(CheckoutRequest {
+            reference: &order.id,
+            idempotency_key,
+            custom_id: &format!("{}|{}", shop.slug, order.id),
+            brand_name: &shop.name,
+            payee_email: &shop.paypal_email,
+            order,
+            fulfillment: order.fulfillment,
+            return_url: &format!("{base_url}/checkout/return?{query}"),
+            cancel_url: &format!("{base_url}/checkout/cancel?{query}"),
+        })
+        .await
+        .map_err(|error| {
+            tracing::error!(?error, order = %order.id, "paypal checkout failed");
+            user_error("PayPal could not start this checkout. Please try again shortly.")
+        })
+}
+
+/// Builds an order from the shop's own catalog. Prices never come from the caller,
+/// so an assistant cannot talk the shop into a different total.
+pub async fn create_checkout(app: &App, shop: &Shop, args: CheckoutArgs, channel: Channel, base_url: &str) -> AppResult<Value> {
+    ensure_open(shop)?;
     if args.items.is_empty() {
         return Err(user_error("Add at least one item."));
     }
@@ -289,6 +338,9 @@ pub async fn create_checkout(app: &App, shop: &Shop, args: CheckoutArgs, channel
         };
         if !product.in_stock {
             return Err(user_error(format!("{} is sold out.", product.name)));
+        }
+        if product.by_quote {
+            return Err(user_error(format!("{} has no fixed price. Use request_quote to ask the shop for one.", product.name)));
         }
         if line.quantity < 1 || line.quantity > MAX_QUANTITY {
             return Err(user_error(format!("Quantity for {} must be between 1 and {MAX_QUANTITY}.", product.name)));
@@ -327,29 +379,17 @@ pub async fn create_checkout(app: &App, shop: &Shop, args: CheckoutArgs, channel
         tracking: None,
         created_at: now(),
         paid_at: None,
+        request: None,
+        contact: None,
+        quote_note: None,
     };
     app.store.put_order(&order).await?;
 
-    let query = format!("shop={}&ref={reference}", shop.slug);
-    let created = app
-        .paypal
-        .create_order(CheckoutRequest {
-            reference: &reference,
-            custom_id: &format!("{}|{reference}", shop.slug),
-            brand_name: &shop.name,
-            payee_email: &shop.paypal_email,
-            order: &order,
-            fulfillment,
-            return_url: &format!("{base_url}/checkout/return?{query}"),
-            cancel_url: &format!("{base_url}/checkout/cancel?{query}"),
-        })
-        .await;
-    let created = match created {
+    let created = match open_checkout(app, shop, &order, format!("create-{reference}"), base_url).await {
         Ok(created) => created,
         Err(error) => {
-            tracing::error!(?error, reference, "paypal checkout failed");
             app.store.set_order_status(&order, OrderStatus::Failed).await?;
-            return Err(user_error("PayPal could not start this checkout. Please try again shortly."));
+            return Err(error);
         }
     };
     app.store.attach_paypal_order(&order, &created.id, &created.approval_url).await?;
@@ -359,7 +399,7 @@ pub async fn create_checkout(app: &App, shop: &Shop, args: CheckoutArgs, channel
     let summary = format!("Started checkout {reference} for {}", display_money(order.total_minor, &order.currency));
     app.store.record_event(&shop.slug, "checkout", &summary, channel).await?;
 
-    let mut view = agent_order(shop, &order);
+    let mut view = agent_order(shop, &order, base_url);
     view["next_step"] = json!("Give the shopper approval_url. Nothing is charged until they approve the order in PayPal.");
     Ok(view)
 }
@@ -384,7 +424,16 @@ pub async fn sync_order(app: &App, shop: &Shop, order: Order) -> AppResult<Order
     let Some(paypal_id) = order.paypal_order_id.clone().filter(|_| order.status == OrderStatus::AwaitingPayment) else {
         return Ok(order);
     };
-    let remote = app.paypal.get_order(&paypal_id).await?;
+    let remote = match app.paypal.get_order(&paypal_id).await {
+        Ok(remote) => remote,
+        // PayPal forgets orders nobody approved. A quote stays payable, so it goes back to being priced.
+        Err(error) if error.status == 404 => {
+            let status = if order.is_quote() { OrderStatus::Quoted } else { OrderStatus::Cancelled };
+            app.store.set_order_status(&order, status).await?;
+            return Ok(Order { status, ..order });
+        }
+        Err(error) => return Err(error.into()),
+    };
     match remote.order_status.as_str() {
         "APPROVED" => {
             let captured = app.paypal.capture_order(&paypal_id).await?;
@@ -396,11 +445,120 @@ pub async fn sync_order(app: &App, shop: &Shop, order: Order) -> AppResult<Order
     Ok(app.store.get_order(&shop.slug, &order.id).await?.unwrap_or(order))
 }
 
-pub async fn order_status(app: &App, shop: &Shop, reference: &str) -> AppResult<Value> {
+pub async fn order_status(app: &App, shop: &Shop, reference: &str, base_url: &str) -> AppResult<Value> {
     let Some(order) = app.store.get_order(&shop.slug, reference.trim()).await? else {
         return Err(user_error(format!("No order with reference \"{reference}\" at {}.", shop.name)));
     };
-    Ok(agent_order(shop, &sync_order(app, shop, order).await?))
+    Ok(agent_order(shop, &sync_order(app, shop, order).await?, base_url))
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct QuoteArgs {
+    /// Everything the shop needs to set a price, such as what it is, size, quantity, date and wording
+    pub request: String,
+    /// The product this is about, when it is in the catalog
+    pub product_id: Option<String>,
+    /// How the shopper wants to receive it
+    pub fulfillment: Option<Fulfillment>,
+    /// How the shop can reach the shopper with questions, such as an email address
+    pub contact: Option<String>,
+}
+
+/// Asks the shop for a price. Starts as an order with no amount, then joins the normal path once priced.
+pub async fn request_quote(app: &App, shop: &Shop, args: QuoteArgs, channel: Channel, base_url: &str) -> AppResult<Value> {
+    ensure_open(shop)?;
+    let request: String = args.request.trim().chars().take(MAX_REQUEST_CHARS).collect();
+    if request.is_empty() {
+        return Err(user_error("Describe what the shopper wants priced."));
+    }
+    let product = match args.product_id.as_deref().map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => Some(app.store.get_product(&shop.slug, id).await?.ok_or_else(|| user_error(format!("No product with id \"{id}\". Use search_products to find valid ids.")))?),
+        None => None,
+    };
+    let fulfillment = choose_fulfillment(shop, args.fulfillment)?;
+    let (product_id, name) = product.map_or_else(|| (String::new(), request.chars().take(80).collect()), |product| (product.id, product.name));
+    let order = Order {
+        id: new_reference(),
+        shop_slug: shop.slug.clone(),
+        status: OrderStatus::AwaitingQuote,
+        paypal_order_id: None,
+        paypal_capture_id: None,
+        items: vec![OrderItem { product_id, name, options: vec![], quantity: 1, unit_minor: 0 }],
+        currency: shop.currency.clone(),
+        items_minor: 0,
+        shipping_minor: 0,
+        total_minor: 0,
+        fulfillment,
+        note: String::new(),
+        channel,
+        approval_url: None,
+        buyer_name: None,
+        buyer_email: None,
+        ship_to: None,
+        tracking: None,
+        created_at: now(),
+        paid_at: None,
+        contact: args.contact.map(|contact| contact.trim().chars().take(200).collect::<String>()).filter(|contact| !contact.is_empty()),
+        request: Some(request),
+        quote_note: None,
+    };
+    app.store.put_order(&order).await?;
+    app.store.record_event(&shop.slug, "quote", &format!("Asked for a price: {}", order.items[0].name), channel).await?;
+    Ok(agent_order(shop, &order, base_url))
+}
+
+fn optional_note(note: &str) -> Option<&str> {
+    Some(note.trim()).filter(|note| !note.is_empty())
+}
+
+/// Sets the full amount the shopper will pay. Delivery is part of the owner's price.
+pub async fn send_quote(app: &App, shop: &Shop, order: Order, price: f64, note: &str) -> AppResult<Order> {
+    if !price.is_finite() || price <= 0.0 || price > MAX_PRICE {
+        return Err(user_error("Enter a price greater than zero."));
+    }
+    let moved_on = || user_error("This request has already moved on.");
+    if !matches!(order.status, OrderStatus::AwaitingQuote | OrderStatus::Quoted) {
+        return Err(moved_on());
+    }
+    let total_minor = to_minor(price, &order.currency);
+    let mut items = order.items.clone();
+    if let Some(item) = items.first_mut() {
+        item.unit_minor = total_minor;
+    }
+    if !app.store.set_quote(&order, &items, total_minor, optional_note(note)).await? {
+        return Err(moved_on());
+    }
+    let summary = format!("Quoted {} for {}", display_money(total_minor, &order.currency), order.id);
+    app.store.record_event(&shop.slug, "quote", &summary, Channel::Owner).await?;
+    Ok(Order { status: OrderStatus::Quoted, items, items_minor: total_minor, total_minor, quote_note: optional_note(note).map(str::to_owned), ..order })
+}
+
+pub async fn decline_quote(app: &App, shop: &Shop, order: Order, note: &str) -> AppResult<Order> {
+    let moved_on = || user_error("This request has already moved on.");
+    if !matches!(order.status, OrderStatus::AwaitingQuote | OrderStatus::Quoted) || !app.store.decline_quote(&order, optional_note(note)).await? {
+        return Err(moved_on());
+    }
+    app.store.record_event(&shop.slug, "quote", &format!("Declined request {}", order.id), Channel::Owner).await?;
+    Ok(Order { status: OrderStatus::Declined, quote_note: optional_note(note).map(str::to_owned), ..order })
+}
+
+/// Opens PayPal for a priced quote and returns the approval link. PayPal forgets unapproved
+/// orders within hours and a shopper may come back days later, so the checkout starts here.
+pub async fn pay_quote(app: &App, shop: &Shop, order: Order, base_url: &str) -> AppResult<String> {
+    let order = sync_order(app, shop, order).await?;
+    match (order.status, &order.approval_url) {
+        (OrderStatus::AwaitingPayment, Some(url)) => return Ok(url.clone()),
+        (OrderStatus::Quoted, _) => {}
+        _ => return Err(user_error("This request isn't waiting for payment.")),
+    }
+    let key = format!("create-{}-{}", order.id, chrono::Utc::now().timestamp_millis());
+    let created = open_checkout(app, shop, &order, key, base_url).await?;
+    if !app.store.start_quote_checkout(&order, &created.id, &created.approval_url).await? {
+        let current = app.store.get_order(&shop.slug, &order.id).await?;
+        return current.and_then(|current| current.approval_url).ok_or_else(|| user_error("This request isn't waiting for payment."));
+    }
+    app.store.record_event(&shop.slug, "checkout", &format!("Started paying {} for {}", order.id, display_money(order.total_minor, &order.currency)), order.channel).await?;
+    Ok(created.approval_url)
 }
 
 /// Tracking is shared with the shopper's assistant. It stays out of PayPal
@@ -434,6 +592,7 @@ mod tests {
             price_text: String::new(),
             price_verified: true,
             position: 0,
+            by_quote: false,
         }
     }
 

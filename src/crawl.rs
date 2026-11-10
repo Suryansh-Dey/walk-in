@@ -1,5 +1,6 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 use scraper::{ElementRef, Html, Node, Selector};
@@ -8,15 +9,18 @@ use url::Url;
 use crate::safe_fetch::{FetchError, SafeFetcher, robots_disallows};
 
 const MAX_PAGES: usize = 14;
-const MAX_PAGE_CHARS: usize = 30_000;
-const MAX_TOTAL_CHARS: usize = 240_000;
+const MAX_PAGE_CHARS: usize = 20_000;
+const MAX_TOTAL_CHARS: usize = 120_000;
+const MAX_PDFS: usize = 4;
+const CRAWL_TIME: Duration = Duration::from_secs(45);
+const PDF_READ_TIME: Duration = Duration::from_secs(15);
 
 static SHOP_WORDS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)shop|store|product|menu|catalog|collection|order|buy|price|item|sale|range").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)shop|store|product|menu|catalog|collection|order|buy|price|pricing|item|sale|range|cake|cater|wedding|service").unwrap());
 static INFO_WORDS: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)about|contact|shipping|delivery|return|refund|faq|polic|hours|visit|location").unwrap());
 static SKIP_PATH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\.(jpe?g|png|gif|webp|svg|pdf|zip|mp4|css|js|ico|xml)$|/(cart|checkout|login|account|signin|register|wp-admin|wp-login|search)(/|$)").unwrap()
+    Regex::new(r"(?i)\.(jpe?g|png|gif|webp|svg|zip|mp4|css|js|ico|xml)$|/(cart|checkout|login|account|signin|register|wp-admin|wp-login|search)(/|$)").unwrap()
 });
 static HIDDEN_STYLE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0|opacity\s*:\s*0").unwrap());
@@ -43,6 +47,10 @@ pub struct ParsedPage {
 pub fn normalize_url(input: &str) -> String {
     let trimmed = input.trim();
     if trimmed.contains("://") { trimmed.to_owned() } else { format!("https://{trimmed}") }
+}
+
+fn is_pdf(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".pdf")
 }
 
 fn selector(css: &str) -> Selector {
@@ -166,7 +174,9 @@ pub fn parse_page(html: &str, page_url: &Url) -> ParsedPage {
             continue;
         }
         let haystack = format!("{} {}", url.path(), anchor.text().collect::<String>());
-        let score = if SHOP_WORDS.is_match(&haystack) {
+        let score = if is_pdf(url.path()) {
+            4
+        } else if SHOP_WORDS.is_match(&haystack) {
             3
         } else if INFO_WORDS.is_match(&haystack) {
             2
@@ -220,6 +230,21 @@ pub enum CrawlError {
     Fetch(#[from] FetchError),
 }
 
+/// Many small food businesses publish their menu or price list only as a PDF.
+/// Nothing here can tell text hidden in a PDF from visible text, so the owner's review is the guard.
+async fn read_pdf(fetcher: &SafeFetcher, url: &str) -> Option<CrawledPage> {
+    let (url, bytes) = fetcher.fetch_pdf(url).await.ok()?;
+    // The parser can panic or stall on a malformed file, so it gets its own thread and a deadline.
+    let parsed = tokio::time::timeout(PDF_READ_TIME, tokio::task::spawn_blocking(move || pdf_extract::extract_text_from_mem(&bytes))).await;
+    let mut text = tidy(&parsed.ok()?.ok()?.ok()?);
+    truncate_chars(&mut text, MAX_PAGE_CHARS);
+    if text.is_empty() {
+        return None;
+    }
+    let title = url.path_segments().and_then(Iterator::last).unwrap_or("PDF").to_owned();
+    Some(CrawledPage { url: url.to_string(), title, text })
+}
+
 pub async fn crawl_site<F: Future<Output = ()>>(
     fetcher: &SafeFetcher,
     start: &str,
@@ -239,11 +264,24 @@ pub async fn crawl_site<F: Future<Output = ()>>(
     let mut seen: HashSet<String> = HashSet::from([start_url.to_string()]);
     let mut queue = BinaryHeap::from([QueuedLink { score: 10, url: start_url.to_string() }]);
     let mut total_chars = 0;
+    let mut pdfs_read = 0;
+    let started = Instant::now();
 
-    while pages.len() < MAX_PAGES && total_chars < MAX_TOTAL_CHARS {
+    while pages.len() < MAX_PAGES && total_chars < MAX_TOTAL_CHARS && started.elapsed() < CRAWL_TIME {
         let Some(next) = queue.pop() else { break };
         let path = Url::parse(&next.url).map(|url| url.path().to_owned()).unwrap_or_default();
         if robots_disallows(&robots, &path) {
+            continue;
+        }
+        if is_pdf(&path) {
+            if pdfs_read < MAX_PDFS && !pages.is_empty() {
+                pdfs_read += 1;
+                if let Some(page) = read_pdf(fetcher, &next.url).await {
+                    total_chars += page.text.chars().count();
+                    pages.push(page);
+                    on_page(pages.len()).await;
+                }
+            }
             continue;
         }
         let fetched = match fetcher.fetch(&next.url).await {
@@ -298,14 +336,15 @@ mod tests {
     #[test]
     fn ranks_links_and_keeps_to_one_site() {
         let html = r#"<body><a href="/menu.html">Our menu</a><a href="/about">About us</a><a href="/news/1">News</a>
-            <a href="https://other.test/shop">Other</a><a href="/cart">Cart</a><a href="/photo.jpg">Pic</a></body>"#;
+            <a href="https://other.test/shop">Other</a><a href="/cart">Cart</a><a href="/photo.jpg">Pic</a><a href="/files/Spring.PDF">Spring</a></body>"#;
         let page = parse_page(html, &Url::parse("https://shop.test/").unwrap());
         let score = |path: &str| page.links.iter().find(|(url, _)| url.path() == path).map(|(_, score)| *score);
+        assert_eq!(score("/files/Spring.PDF"), Some(4), "a PDF on a small site is usually the menu");
         assert_eq!(score("/menu.html"), Some(3));
         assert_eq!(score("/about"), Some(2));
         assert_eq!(score("/news/1"), Some(1));
         assert_eq!(score("/cart"), None);
         assert_eq!(score("/photo.jpg"), None);
-        assert_eq!(page.links.len(), 3);
+        assert_eq!(page.links.len(), 4);
     }
 }

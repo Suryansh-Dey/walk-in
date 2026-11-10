@@ -56,7 +56,8 @@ input, textarea, button { font: inherit; color: inherit; }
 .chip-static { cursor: default; border-color: var(--line); background: #f4eddf; font-size: 0.78rem; padding: 2px 9px; white-space: nowrap; }
 .chip-static.is-failed { color: var(--tomato); }
 .status-paid { background: #dcefe5; color: var(--forest); }
-.status-failed, .status-cancelled, .status-refunded { background: var(--tomato-soft); color: #9b3019; }
+.status-awaiting_quote { background: #fbeccb; color: #7a5310; }
+.status-failed, .status-cancelled, .status-refunded, .status-declined { background: var(--tomato-soft); color: #9b3019; }
 
 /* The door sign */
 .sign { position: relative; width: 170px; height: 76px; perspective: 700px; }

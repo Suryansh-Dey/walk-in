@@ -12,20 +12,28 @@ pub enum ShopStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderStatus {
+    /// A shopper asked for a price and the shop hasn't given one.
+    AwaitingQuote,
+    /// The shop gave a price. No PayPal checkout exists until the shopper is ready to pay.
+    Quoted,
     AwaitingPayment,
     Paid,
     Refunded,
     Cancelled,
+    Declined,
     Failed,
 }
 
 impl OrderStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            OrderStatus::AwaitingQuote => "awaiting_quote",
+            OrderStatus::Quoted => "quoted",
             OrderStatus::AwaitingPayment => "awaiting_payment",
             OrderStatus::Paid => "paid",
             OrderStatus::Refunded => "refunded",
             OrderStatus::Cancelled => "cancelled",
+            OrderStatus::Declined => "declined",
             OrderStatus::Failed => "failed",
         }
     }
@@ -103,6 +111,9 @@ pub struct Product {
     pub price_text: String,
     pub price_verified: bool,
     pub position: u32,
+    /// No fixed price. Shoppers ask the shop for one instead of checking out.
+    #[serde(default)]
+    pub by_quote: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -150,6 +161,19 @@ pub struct Order {
     pub tracking: Option<Tracking>,
     pub created_at: String,
     pub paid_at: Option<String>,
+    /// What the shopper asked the shop to price. Only quote requests have one.
+    #[serde(default)]
+    pub request: Option<String>,
+    #[serde(default)]
+    pub contact: Option<String>,
+    #[serde(default)]
+    pub quote_note: Option<String>,
+}
+
+impl Order {
+    pub fn is_quote(&self) -> bool {
+        self.request.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

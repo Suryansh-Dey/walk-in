@@ -1,4 +1,4 @@
-//! Walks a shop from import to refund against mocked PayPal and OpenRouter.
+//! Walks a shop from import to refund, and a custom request from quote to payment, against mocked PayPal and OpenRouter.
 //!
 //! Needs a local DynamoDB, so it is ignored by default:
 //!
@@ -31,6 +31,8 @@ fn catalog(base: &str) -> Value {
             "source_url": format!("{base}/demo/juniper-bakery/cakes.html"), "in_stock": true,
         })
     };
+    let mut custom = product("Custom Tiered Cake", 0.0, "Price on request");
+    custom["price"] = Value::Null;
     json!({
         "shop": {
             "name": "Juniper & Rye Bakery", "description": "A bakery.", "location": "Portland", "contact": "", "hours": "",
@@ -39,6 +41,7 @@ fn catalog(base: &str) -> Value {
         "products": [
             product("Chocolate Celebration Cake, 6 inch", 34.0, "$34.00"),
             product("Wedding Tasting Box", 45.0, "forty-five dollars"),
+            custom,
         ],
         "warnings": [],
     })
@@ -182,6 +185,7 @@ async fn shop_goes_from_website_to_refund() {
     let prompt = serde_json::to_string(&bodies(&sent, "/chat/completions")[0]).unwrap();
     assert!(prompt.contains("Alder Street"), "the crawler should read the site");
     assert!(!prompt.contains("$0.01"), "hidden text must never reach the model");
+    assert!(prompt.contains("Coffee Morning Platter"), "a linked PDF menu should be read");
 
     // Nothing is reachable before the owner opens the shop.
     assert_eq!(mcp.rpc("tools/list", json!({})).await.status(), 404);
@@ -194,6 +198,9 @@ async fn shop_goes_from_website_to_refund() {
     let flagged = products.iter().find(|product| product["priceVerified"] == json!(false)).unwrap();
     assert_eq!(flagged["name"], "Wedding Tasting Box");
     let cake = products.iter().find(|product| product["priceVerified"] == json!(true)).unwrap()["id"].as_str().unwrap().to_owned();
+    let custom = products.iter().find(|product| product["byQuote"] == json!(true)).expect("items with no price are kept");
+    assert_eq!(custom["name"], "Custom Tiered Cake");
+    let custom = custom["id"].as_str().unwrap().to_owned();
 
     let (status, body) = owner.publish().await;
     assert_eq!((status, body["error"].as_str().unwrap()), (400, "Confirm 1 flagged price before opening."));
@@ -206,10 +213,14 @@ async fn shop_goes_from_website_to_refund() {
 
     // An assistant shops through MCP, and cannot choose its own price.
     let tools: Value = mcp.rpc("tools/list", json!({})).await.json().await.unwrap();
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 7);
     let (is_error, found) = mcp.call("search_products", json!({ "query": "birthday cakes", "max_price": 40 })).await;
     assert!(!is_error);
-    assert_eq!(found["total_found"], 1);
+    assert_eq!(found["total_found"], 2, "a budget can't rule out an item with no price");
+    let unpriced = found["results"].as_array().unwrap().iter().find(|product| product["pricing"] == "quote").unwrap();
+    assert_eq!(unpriced["price"], Value::Null);
+    let (is_error, message) = mcp.call("create_checkout", json!({ "items": [{ "product_id": custom, "quantity": 1 }] })).await;
+    assert!(is_error && message.to_string().contains("request_quote"), "{message}");
     let (is_error, order) = mcp.call("create_checkout", json!({ "items": [{ "product_id": cake, "quantity": 1, "price": 0.01 }], "note": "Happy birthday" })).await;
     assert!(!is_error, "{order}");
     assert_eq!(order["total"], "34.00");
@@ -275,4 +286,66 @@ async fn shop_goes_from_website_to_refund() {
     assert_eq!(webhook("good", refund("34.00")).await.unwrap().status(), 200);
     let dashboard = owner.get("/dashboard").await;
     assert_eq!((dashboard["orders"][0]["status"].as_str().unwrap(), dashboard["stats"]["revenue"].as_str().unwrap()), ("refunded", "0.00"));
+
+    // A custom request: asked for by an assistant, priced by the owner, paid through PayPal.
+    let reply = |status: u16, body: Value| ResponseTemplate::new(status).set_body_json(body);
+    Mock::given(method("POST")).and(path("/v2/checkout/orders")).and(body_string_contains("120.00"))
+        .respond_with(reply(201, json!({ "id": "PP2", "status": "PAYER_ACTION_REQUIRED", "links": [{ "rel": "payer-action", "href": "https://paypal.test/approve2" }] })))
+        .with_priority(1).mount(&paypal).await;
+    let lookup = || Mock::given(method("GET")).and(path("/v2/checkout/orders/PP2"));
+    lookup().respond_with(reply(404, json!({ "name": "RESOURCE_NOT_FOUND", "message": "gone" }))).up_to_n_times(1).with_priority(1).mount(&paypal).await;
+    lookup().respond_with(reply(200, json!({ "id": "PP2", "status": "PAYER_ACTION_REQUIRED" }))).up_to_n_times(1).with_priority(2).mount(&paypal).await;
+    lookup().respond_with(reply(200, json!({ "id": "PP2", "status": "APPROVED" }))).with_priority(3).mount(&paypal).await;
+    let captured = json!({ "id": "PP2", "status": "COMPLETED", "purchase_units": [{ "payments": { "captures": [{ "id": "CAP2", "status": "COMPLETED" }] } }] });
+    Mock::given(method("POST")).and(path("/v2/checkout/orders/PP2/capture")).respond_with(reply(201, captured)).expect(1).mount(&paypal).await;
+
+    let (is_error, quote) = mcp.call("request_quote", json!({ "request": "Three tier lemon cake for 80 guests on June 3", "product_id": custom, "contact": "sam@example.com" })).await;
+    assert!(!is_error, "{quote}");
+    let reference = quote["order_reference"].as_str().unwrap().to_owned();
+    assert_eq!((quote["status"].as_str(), &quote["total"], &quote["approval_url"]), (Some("awaiting_quote"), &Value::Null, &Value::Null));
+    assert_eq!(quote["status_url"], format!("{base}/quote/{}/{reference}", owner.slug));
+
+    let shopper = |suffix: &str| format!("{base}/api/shops/{}/quotes/{reference}{suffix}", owner.slug);
+    let status_of = async |http: &Client| -> Value { http.get(shopper("")).send().await.unwrap().json().await.unwrap() };
+    let pay = async |http: &Client| { let response = http.post(shopper("/pay")).send().await.unwrap(); (response.status().as_u16(), response.json::<Value>().await.unwrap()) };
+
+    let view = status_of(&http).await;
+    assert_eq!((view["status"].as_str(), &view["total"]), (Some("awaiting_quote"), &Value::Null));
+    assert!(!view.to_string().contains("sam@example.com"), "the public page must not show contact details");
+    assert_eq!(pay(&http).await.0, 400, "nothing can be paid before the shop names a price");
+    let catalog_order = dashboard["orders"][0]["id"].as_str().unwrap().to_owned();
+    let hidden = http.get(format!("{base}/api/shops/{}/quotes/{catalog_order}", owner.slug)).send().await.unwrap();
+    assert_eq!(hidden.status(), 404, "ordinary orders stay off the public route");
+
+    let price = json!({ "price": 120.0, "note": "Includes delivery." });
+    let stranger = Owner { key: "wrong".into(), http: http.clone(), base: base.clone(), slug: owner.slug.clone() };
+    assert_eq!(stranger.send(reqwest::Method::POST, &format!("/orders/{reference}/quote"), Some(price.clone())).await.0, 403);
+    assert_eq!(owner.send(reqwest::Method::POST, &format!("/orders/{reference}/quote"), Some(json!({ "price": 0 }))).await.0, 400);
+    assert_eq!(owner.send(reqwest::Method::POST, &format!("/orders/{reference}/quote"), Some(price)).await.0, 200);
+    let (_, status) = mcp.call("get_order_status", json!({ "order_reference": reference })).await;
+    assert_eq!((status["status"].as_str(), status["total"].as_str(), status["message_from_shop"].as_str()), (Some("quoted"), Some("120.00"), Some("Includes delivery.")));
+
+    // PayPal forgets an unapproved order, and the shopper can still pay later.
+    assert_eq!(pay(&http).await.1["approvalUrl"], "https://paypal.test/approve2");
+    assert_eq!(status_of(&http).await["status"], "quoted");
+    let (code, opened) = pay(&http).await;
+    assert_eq!((code, opened["approvalUrl"].as_str()), (200, Some("https://paypal.test/approve2")));
+    assert_eq!(pay(&http).await.1["approvalUrl"], "https://paypal.test/approve2", "a live checkout is reused");
+    let requests = paypal.received_requests().await.unwrap();
+    let created: Vec<&Request> = requests.iter().filter(|request| request.url.path() == "/v2/checkout/orders" && String::from_utf8_lossy(&request.body).contains("120.00")).collect();
+    assert_eq!(created.len(), 2, "one PayPal order per live checkout");
+    let idempotency = |request: &Request| request.headers.get("paypal-request-id").unwrap().to_str().unwrap().to_owned();
+    assert_ne!(idempotency(created[0]), idempotency(created[1]), "PayPal would hand back the expired order");
+    let unit = &created[1].body_json::<Value>().unwrap()["purchase_units"][0];
+    assert_eq!((unit["payee"]["email_address"].as_str(), unit["amount"]["value"].as_str()), (Some(SELLER), Some("120.00")));
+    assert_eq!(unit["amount"]["breakdown"]["item_total"]["value"], "120.00");
+
+    assert_eq!(status_of(&http).await["status"], "paid");
+    assert_eq!(owner.send(reqwest::Method::POST, &format!("/orders/{reference}/quote"), Some(json!({ "price": 1 }))).await.0, 400, "a paid request can't be repriced");
+
+    let (_, declined) = mcp.call("request_quote", json!({ "request": "A cake shaped like a castle" })).await;
+    let other = declined["order_reference"].as_str().unwrap();
+    assert_eq!(owner.send(reqwest::Method::POST, &format!("/orders/{other}/decline"), Some(json!({ "note": "Booked that week." }))).await.0, 200);
+    let (_, status) = mcp.call("get_order_status", json!({ "order_reference": other })).await;
+    assert_eq!((status["status"].as_str(), &status["total"], status["message_from_shop"].as_str()), (Some("declined"), &Value::Null, Some("Booked that week.")));
 }

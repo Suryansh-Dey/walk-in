@@ -10,6 +10,7 @@ use url::Url;
 
 const MAX_REDIRECTS: usize = 5;
 const MAX_BYTES: usize = 3 * 1024 * 1024;
+const MAX_PDF_BYTES: usize = 8 * 1024 * 1024;
 const USER_AGENT: &str = "WalkInImporter/0.1";
 
 #[derive(Debug, thiserror::Error)]
@@ -125,15 +126,15 @@ impl SafeFetcher {
         Ok(url)
     }
 
-    /// Fetches a text document, re-validating the target on every redirect hop.
-    pub async fn fetch(&self, raw: &str) -> Result<FetchedPage, FetchError> {
+    /// Opens a URL, re-validating the target on every redirect hop.
+    async fn open(&self, raw: &str, accept: &str) -> Result<(Url, reqwest::Response), FetchError> {
         let mut current = self.check_url(raw)?;
         for _ in 0..=MAX_REDIRECTS {
             let failed = |reason: String, url: &Url| FetchError::Failed { url: url.to_string(), reason };
             let response = self
                 .client
                 .get(current.clone())
-                .header("accept", "text/html,text/plain;q=0.9")
+                .header("accept", accept)
                 .send()
                 .await
                 .map_err(|error| failed(error.to_string(), &current))?;
@@ -151,32 +152,52 @@ impl SafeFetcher {
             if !status.is_success() {
                 return Err(failed(format!("HTTP {status}"), &current));
             }
-            let content_type = response
-                .headers()
-                .get("content-type")
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("")
-                .to_owned();
-            if !content_type.is_empty() && !content_type.contains("text/") && !content_type.contains("xhtml") {
-                return Err(failed(format!("not a web page ({content_type})"), &current));
-            }
-            let body = read_limited(response).await.map_err(|error| failed(error.to_string(), &current))?;
-            return Ok(FetchedPage { url: current, body });
+            return Ok((current, response));
         }
         Err(FetchError::Failed { url: raw.to_owned(), reason: "too many redirects".to_owned() })
     }
+
+    /// Fetches a text document.
+    pub async fn fetch(&self, raw: &str) -> Result<FetchedPage, FetchError> {
+        let (url, response) = self.open(raw, "text/html,text/plain;q=0.9").await?;
+        let content_type = content_type(&response);
+        if !content_type.is_empty() && !content_type.contains("text/") && !content_type.contains("xhtml") {
+            return Err(FetchError::Failed { url: url.to_string(), reason: format!("not a web page ({content_type})") });
+        }
+        let bytes = read_limited(response, MAX_BYTES).await.map_err(|error| FetchError::Failed { url: url.to_string(), reason: error.to_string() })?;
+        Ok(FetchedPage { url, body: String::from_utf8_lossy(&bytes).into_owned() })
+    }
+
+    /// Fetches a PDF. One over the limit is refused, because a cut-off file can't be parsed.
+    pub async fn fetch_pdf(&self, raw: &str) -> Result<(Url, Vec<u8>), FetchError> {
+        let (url, response) = self.open(raw, "application/pdf").await?;
+        let failed = |reason: String, url: &Url| FetchError::Failed { url: url.to_string(), reason };
+        let content_type = content_type(&response);
+        if !content_type.is_empty() && !content_type.contains("pdf") && !content_type.contains("octet-stream") {
+            return Err(failed(format!("not a PDF ({content_type})"), &url));
+        }
+        let bytes = read_limited(response, MAX_PDF_BYTES + 1).await.map_err(|error| failed(error.to_string(), &url))?;
+        if bytes.len() > MAX_PDF_BYTES {
+            return Err(failed("too large".to_owned(), &url));
+        }
+        Ok((url, bytes))
+    }
 }
 
-async fn read_limited(mut response: reqwest::Response) -> reqwest::Result<String> {
+fn content_type(response: &reqwest::Response) -> String {
+    response.headers().get("content-type").and_then(|value| value.to_str().ok()).unwrap_or("").to_owned()
+}
+
+async fn read_limited(mut response: reqwest::Response, limit: usize) -> reqwest::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         bytes.extend_from_slice(&chunk);
-        if bytes.len() >= MAX_BYTES {
-            bytes.truncate(MAX_BYTES);
+        if bytes.len() >= limit {
+            bytes.truncate(limit);
             break;
         }
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(bytes)
 }
 
 /// A small robots.txt reader covering the rules that apply to every crawler.

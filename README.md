@@ -8,12 +8,13 @@ The owner also sees something their website could never tell them: what people a
 
 ## How it works
 
-1. **Read.** A crawler reads up to 14 pages of the site. It respects `robots.txt` and refuses private addresses. Text hidden with CSS is removed before the model sees it, so a page can't quietly instruct the model.
-2. **Extract and verify.** DeepSeek returns a catalog as strict structured output. Code then checks every price: its exact text must appear on the cited page and parse to the claimed amount. Anything else is flagged for the owner.
+1. **Read.** A crawler reads up to 14 pages of the site, plus up to four linked PDFs, since many small food businesses publish their menu only as a PDF. It respects `robots.txt` and refuses private addresses. Text hidden with CSS is removed before the model sees it, so a page can't quietly instruct the model.
+2. **Extract and verify.** DeepSeek returns a catalog as strict structured output. Code then checks every price: its exact text must appear on the cited page and parse to the claimed amount. Anything else is flagged for the owner. Items with no published price are kept as "by quote", and the model is told never to estimate one.
 3. **Open.** The owner fixes what was flagged, connects PayPal, proves they control the site with a meta tag, and opens the shop.
-4. **Sell.** Each shop gets `/mcp/<slug>` with six tools, and a hosted chat at `/shop/<slug>` for people without an MCP client. Both call the same code.
+4. **Sell.** Each shop gets `/mcp/<slug>` with seven tools, and a hosted chat at `/shop/<slug>` for people without an MCP client. Both call the same code.
 5. **Get paid.** `create_checkout` builds the order only from catalog prices, so an assistant can't change a total. The shopper approves in PayPal and the order is captured once, whether the return page, the assistant or a webhook reports it first.
-6. **Learn.** The dashboard shows live activity, orders with tracking, and the unmet demand assistants reported.
+6. **Quote.** Custom work and items with no listed price go through `request_quote`. The request lands on the owner's dashboard, the owner names a price, and the shopper pays it through PayPal from a status link. Owners see requests on the dashboard only, there is no email yet. The PayPal order is created when the shopper clicks Pay, because PayPal drops unapproved orders within hours and a shopper may come back days later.
+7. **Learn.** The dashboard shows live activity, orders with tracking, and the unmet demand assistants reported.
 
 ## How PayPal is used
 

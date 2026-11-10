@@ -15,7 +15,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::App;
 use crate::chat::{ChatMessage, run_chat};
-use crate::commerce::{sync_order, track_order};
+use crate::commerce::{decline_quote, pay_quote, send_quote, sync_order, track_order};
 use crate::error::{AppError, AppResult, user_error};
 use crate::importer::{check_ownership, start_import};
 use crate::model::{Channel, Order, OrderStatus, Product, Shop, ShopStatus, now};
@@ -252,7 +252,8 @@ struct ProductBody {
     name: String,
     #[serde(default)]
     description: String,
-    price: f64,
+    /// Empty means the item is sold by quote.
+    price: Option<f64>,
     #[serde(default)]
     category: String,
     #[serde(default = "yes")]
@@ -271,7 +272,7 @@ impl ProductBody {
         bounded(&self.name, 200, "The product name")?;
         bounded(&self.description, 2000, "The description")?;
         bounded(&self.category, 100, "The category")?;
-        if !self.price.is_finite() || self.price <= 0.0 || self.price > 1_000_000.0 {
+        if self.price.is_some_and(|price| !price.is_finite() || price <= 0.0 || price > 1_000_000.0) {
             return Err(user_error("Enter a price greater than zero."));
         }
         Ok(())
@@ -288,7 +289,7 @@ async fn add_product(State(app): State<App>, Path(slug): Path<String>, headers: 
         id: format!("m{position:03}"),
         name: body.name.trim().to_owned(),
         description: body.description,
-        price_minor: to_minor(body.price, &shop.currency),
+        price_minor: body.price.map_or(0, |price| to_minor(price, &shop.currency)),
         category: body.category,
         tags: vec![],
         options: vec![],
@@ -298,6 +299,7 @@ async fn add_product(State(app): State<App>, Path(slug): Path<String>, headers: 
         price_text: String::new(),
         price_verified: true,
         position,
+        by_quote: body.price.is_none(),
     };
     app.store.put_product(&slug, &product).await?;
     Ok((StatusCode::CREATED, Json(product_view(&shop, &product))).into_response())
@@ -312,7 +314,8 @@ async fn update_product(State(app): State<App>, Path((slug, id)): Path<(String, 
     body.validate()?;
     product.name = body.name.trim().to_owned();
     product.description = body.description;
-    product.price_minor = to_minor(body.price, &shop.currency);
+    product.price_minor = body.price.map_or(0, |price| to_minor(price, &shop.currency));
+    product.by_quote = body.price.is_none();
     product.category = body.category;
     product.in_stock = body.in_stock;
     // Saving a product is the owner confirming its price.
@@ -409,6 +412,69 @@ async fn track(State(app): State<App>, Path((slug, id)): Path<(String, String)>,
     bounded(&body.carrier, 60, "The carrier")?;
     bounded(&body.number, 64, "The tracking number")?;
     Ok(Json(order_view(&app, &track_order(&app, &shop, order, body.carrier.trim(), body.number.trim()).await?)))
+}
+
+#[derive(Deserialize)]
+struct QuoteBody {
+    price: f64,
+    #[serde(default)]
+    note: String,
+}
+
+async fn quote_order(State(app): State<App>, Path((slug, id)): Path<(String, String)>, headers: HeaderMap, body: Bytes) -> AppResult<Json<Value>> {
+    let (shop, order) = owner_order(&app, &slug, &id, &headers).await?;
+    let body: QuoteBody = parse_json(&body)?;
+    bounded(&body.note, 500, "The message")?;
+    Ok(Json(order_view(&app, &send_quote(&app, &shop, order, body.price, &body.note).await?)))
+}
+
+#[derive(Deserialize)]
+struct DeclineBody {
+    #[serde(default)]
+    note: String,
+}
+
+async fn decline_order(State(app): State<App>, Path((slug, id)): Path<(String, String)>, headers: HeaderMap, body: Bytes) -> AppResult<Json<Value>> {
+    let (shop, order) = owner_order(&app, &slug, &id, &headers).await?;
+    let body: DeclineBody = parse_json(&body)?;
+    bounded(&body.note, 500, "The message")?;
+    Ok(Json(order_view(&app, &decline_quote(&app, &shop, order, &body.note).await?)))
+}
+
+/// Finds a quote for a shopper. Ordinary orders stay out of reach of this public route.
+async fn shopper_quote(app: &App, slug: &str, id: &str) -> AppResult<(Shop, Order)> {
+    let shop = live_shop(app, slug).await?;
+    let order = app.store.get_order(slug, id).await?.filter(Order::is_quote).ok_or_else(|| AppError::NotFound("We can't find that request.".to_owned()))?;
+    Ok((shop, order))
+}
+
+async fn quote_status(State(app): State<App>, Extension(ClientIp(ip)): Extension<ClientIp>, Path((slug, id)): Path<(String, String)>) -> AppResult<Json<Value>> {
+    app.rate_limit("quote", &ip, 240, 2000, MINUTE).await?;
+    let (shop, order) = shopper_quote(&app, &slug, &id).await?;
+    let order = match sync_order(&app, &shop, order.clone()).await {
+        Ok(current) => current,
+        Err(error) => {
+            tracing::error!(?error, order = %order.id, "could not refresh quote");
+            order
+        }
+    };
+    let priced = !matches!(order.status, OrderStatus::AwaitingQuote | OrderStatus::Declined);
+    Ok(Json(json!({
+        "shop": shop.name,
+        "reference": order.id,
+        "status": order.status,
+        "request": order.request,
+        "total": priced.then(|| format_minor(order.total_minor, &order.currency)),
+        "currency": order.currency,
+        "note": order.quote_note,
+    })))
+}
+
+async fn quote_pay(State(app): State<App>, Extension(ClientIp(ip)): Extension<ClientIp>, Path((slug, id)): Path<(String, String)>, headers: HeaderMap) -> AppResult<Json<Value>> {
+    app.rate_limit("quote-pay", &ip, 30, 300, HOUR).await?;
+    let (shop, order) = shopper_quote(&app, &slug, &id).await?;
+    let approval_url = pay_quote(&app, &shop, order, &origin(&app, &headers)).await?;
+    Ok(Json(json!({ "approvalUrl": approval_url })))
 }
 
 async fn public_shop(State(app): State<App>, Path(slug): Path<String>) -> AppResult<Json<Value>> {
@@ -559,7 +625,7 @@ async fn checkout_return(State(app): State<App>, Query(query): Query<CheckoutQue
         return Ok(result_page("Order paid", &inner).into_response());
     }
     let heading = if failed { "We couldn't confirm that payment yet" } else { "This payment isn't finished" };
-    let retry = current.approval_url.as_deref().map_or_else(String::new, |url| format!(r#"<a class="button button-paypal" href="{}">Return to PayPal</a>"#, escape_html(url)));
+    let retry = current.approval_url.as_deref().filter(|_| current.status == OrderStatus::AwaitingPayment).map_or_else(String::new, |url| format!(r#"<a class="button button-paypal" href="{}">Return to PayPal</a>"#, escape_html(url)));
     let inner = format!(
         r#"<p class="eyebrow">Order {id}</p><h1>{heading}</h1><p class="muted">If PayPal showed a confirmation, your assistant can check this order again in a moment.</p>{}{retry}"#,
         order_summary(&current)
@@ -612,6 +678,7 @@ pub fn router(app: App) -> Router {
         .route("/setup/{slug}", page("setup.html"))
         .route("/dashboard/{slug}", page("dashboard.html"))
         .route("/shop/{slug}", page("shop.html"))
+        .route("/quote/{slug}/{id}", page("quote.html"))
         .route("/assets/{*path}", get(asset))
         .route("/checkout/return", get(checkout_return))
         .route("/checkout/cancel", get(checkout_cancel))
@@ -625,6 +692,10 @@ pub fn router(app: App) -> Router {
         .route("/api/shops/{slug}/publish", post(publish_shop))
         .route("/api/shops/{slug}/dashboard", get(dashboard))
         .route("/api/shops/{slug}/orders/{id}/track", post(track))
+        .route("/api/shops/{slug}/orders/{id}/quote", post(quote_order))
+        .route("/api/shops/{slug}/orders/{id}/decline", post(decline_order))
+        .route("/api/shops/{slug}/quotes/{id}", get(quote_status))
+        .route("/api/shops/{slug}/quotes/{id}/pay", post(quote_pay))
         .route("/api/shops/{slug}/public", get(public_shop))
         .route("/api/shops/{slug}/chat", post(chat))
         .layer(DefaultBodyLimit::max(256 * 1024))

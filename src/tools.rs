@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::App;
-use crate::commerce::{self, CheckoutArgs, SearchArgs};
+use crate::commerce::{self, CheckoutArgs, QuoteArgs, SearchArgs};
 use crate::error::{AppResult, user_error};
 use crate::model::{Channel, Shop};
 
@@ -42,7 +42,7 @@ struct ProductArgs {
 
 #[derive(Deserialize, JsonSchema)]
 struct OrderArgs {
-    /// The reference returned by create_checkout, such as WI-AB23CD45
+    /// The reference returned by create_checkout or request_quote, such as WI-AB23CD45
     order_reference: String,
 }
 
@@ -64,7 +64,7 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "search_products",
             title: "Search products",
-            description: "Search what this shop sells. Use a few keywords, such as \"chocolate birthday cake\". Leave query empty to list the catalog. When match is \"some_terms\", the results only partly fit the request.",
+            description: "Search what this shop sells. Use a few keywords, such as \"chocolate birthday cake\". Leave query empty to list the catalog. When match is \"some_terms\", the results only partly fit the request. Results with pricing \"quote\" have no fixed price, so use request_quote for those and never state a price.",
             schema: schema_of::<SearchArgs>(),
             read_only: true,
         },
@@ -78,14 +78,21 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "create_checkout",
             title: "Start PayPal checkout",
-            description: "Create an order and get a PayPal approval link for the shopper. Prices come from the shop's catalog. Nothing is charged until the shopper approves the order in PayPal, so always show them the total and the approval_url.",
+            description: "Create an order for products with a fixed price and get a PayPal approval link for the shopper. Prices come from the shop's catalog. Nothing is charged until the shopper approves the order in PayPal, so always show them the total and the approval_url.",
             schema: schema_of::<CheckoutArgs>(),
+            read_only: false,
+        },
+        ToolDef {
+            name: "request_quote",
+            title: "Ask the shop for a price",
+            description: "Ask the shop to price custom work or a product with no fixed price. Collect the details the shop needs first. The shop replies with a price, and the shopper pays it through PayPal at status_url, so always give them that link.",
+            schema: schema_of::<QuoteArgs>(),
             read_only: false,
         },
         ToolDef {
             name: "get_order_status",
             title: "Check an order",
-            description: "Check whether an order has been paid. Call this after the shopper says they approved it in PayPal.",
+            description: "Check an order or a quote request. Call this after the shopper says they approved a payment in PayPal, or to see whether the shop has set a price.",
             schema: schema_of::<OrderArgs>(),
             read_only: false,
         },
@@ -122,8 +129,9 @@ pub async fn dispatch(context: &ToolContext<'_>, name: &str, args: Value) -> App
         "create_checkout" => commerce::create_checkout(app, shop, parse(args)?, channel, base_url).await,
         "get_order_status" => {
             let args: OrderArgs = parse(args)?;
-            commerce::order_status(app, shop, &args.order_reference).await
+            commerce::order_status(app, shop, &args.order_reference, base_url).await
         }
+        "request_quote" => commerce::request_quote(app, shop, parse(args)?, channel, base_url).await,
         "report_unmet_need" => {
             let args: UnmetArgs = parse(args)?;
             commerce::report_unmet_need(app, shop, &args.need, channel).await

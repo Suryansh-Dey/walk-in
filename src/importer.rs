@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::anyhow;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -10,6 +12,8 @@ use crate::extract::{extract_catalog, verify_catalog};
 use crate::model::{Product, ProgressStep, Shop, ShopStatus, now};
 use crate::money::to_minor;
 use crate::safe_fetch::FetchError;
+
+const EXTRACT_TIME: Duration = Duration::from_secs(240);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ImportJob {
@@ -148,7 +152,9 @@ async fn import(app: &App, shop: &mut Shop) -> anyhow::Result<()> {
     }
 
     advance(app, shop, "Finding your products and prices").await?;
-    let raw = extract_catalog(&app.llm, &pages).await?;
+    let raw = tokio::time::timeout(EXTRACT_TIME, extract_catalog(&app.llm, &pages))
+        .await
+        .map_err(|_| anyhow!(VisibleFailure("Your website took too long to read. Please try again.".to_owned())))??;
 
     advance(app, shop, "Checking every price against your pages").await?;
     let catalog = verify_catalog(raw, &pages);
@@ -189,6 +195,7 @@ async fn import(app: &App, shop: &mut Shop) -> anyhow::Result<()> {
             price_text: product.price_text,
             price_verified: product.price_verified,
             position: position as u32,
+            by_quote: product.by_quote,
         })
         .collect();
     app.store.put_products(&shop.slug, &products).await?;

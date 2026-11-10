@@ -4,7 +4,7 @@ const slug = slugFromPath();
 const key = ownerKey(slug);
 const root = $("#app");
 const CHANNELS = { mcp: "AI assistant", chat: "Shop chat", owner: "You" };
-const STATUS = { awaiting_payment: "Waiting for approval", paid: "Paid", refunded: "Refunded", cancelled: "Cancelled", failed: "Failed" };
+const STATUS = { awaiting_quote: "Needs your price", quoted: "Price sent", awaiting_payment: "Waiting for approval", paid: "Paid", refunded: "Refunded", cancelled: "Cancelled", declined: "Declined", failed: "Failed" };
 
 let built = false;
 let previous = {};
@@ -44,7 +44,7 @@ function build(data) {
       ),
     ),
     el("div", { class: "dash-grid" },
-      el("section", { class: "card" }, el("h2", {}, "Orders"), slots.orderList),
+      el("section", { class: "card" }, el("h2", {}, "Orders and quote requests"), slots.orderList),
       el("div", { class: "dash-side" },
         el("section", { class: "card card-accent" }, el("h2", {}, "What people wanted that you don't sell"), slots.unmet),
         el("section", { class: "card" }, el("h2", {}, "Right now in your shop"), slots.feed),
@@ -69,6 +69,7 @@ function renderUnmet(unmet) {
 
 async function act(path, body, message) {
   message.textContent = "Working...";
+  document.activeElement?.blur();
   try {
     await api(`/api/shops/${slug}/orders/${path}`, { method: "POST", key, body });
     previous.orders = null;
@@ -78,8 +79,29 @@ async function act(path, body, message) {
   }
 }
 
+function quoteForm(order, message) {
+  const price = el("input", { type: "number", min: "0", step: "any", required: true, placeholder: `Price in ${order.currency}`, "aria-label": `Full price in ${order.currency}` });
+  const note = el("input", { placeholder: "Note (optional)", maxlength: "500", "aria-label": "Message to the shopper" });
+  if (order.status === "quoted") {
+    price.value = order.total;
+    note.value = order.quoteNote ?? "";
+  }
+  return el("form", {
+    class: "track-form",
+    onsubmit: (event) => {
+      event.preventDefault();
+      act(`${order.id}/quote`, { price: Number(price.value), note: note.value }, message);
+    },
+  }, price, note,
+    el("button", { class: "button button-primary button-small", type: "submit" }, order.status === "quoted" ? "Update price" : "Send price"),
+    el("button", { class: "button button-text button-small", type: "button", onclick: () => act(`${order.id}/decline`, { note: note.value }, message) }, "Decline"),
+  );
+}
+
 function orderCard(order) {
   const message = el("p", { class: "muted", role: "status" });
+  const open = order.status === "awaiting_quote" || order.status === "quoted";
+  const priced = order.status !== "awaiting_quote" && order.status !== "declined";
   const carrier = el("input", { placeholder: "Carrier", "aria-label": "Carrier" });
   const number = el("input", { placeholder: "Tracking number", "aria-label": "Tracking number" });
   const paid = order.status === "paid";
@@ -87,15 +109,24 @@ function orderCard(order) {
     el("div", { class: "order-head" },
       el("strong", {}, order.id),
       el("span", { class: `chip chip-static status-${order.status}` }, STATUS[order.status] ?? order.status),
-      el("span", { class: "order-total" }, `${order.total} ${order.currency}`),
+      priced ? el("span", { class: "order-total" }, `${order.total} ${order.currency}`) : null,
     ),
-    el("ul", { class: "order-items" }, order.items.map((item) => el("li", {}, `${item.quantity} × ${item.name}`, item.options.length ? ` (${item.options.map(([, value]) => value).join(", ")})` : "", el("span", {}, item.unit)))),
+    order.request
+      ? el("p", { class: "order-note" }, order.request)
+      : el("ul", { class: "order-items" }, order.items.map((item) => el("li", {}, `${item.quantity} × ${item.name}`, item.options.length ? ` (${item.options.map(([, value]) => value).join(", ")})` : "", el("span", {}, item.unit)))),
     el("p", { class: "muted" }, [
       order.buyerName || order.buyerEmail ? `${order.buyerName ?? ""} ${order.buyerEmail ? `<${order.buyerEmail}>` : ""}`.trim() : null,
       order.fulfillment === "ship" ? order.shipTo ? `Ship to ${order.shipTo.name}, ${order.shipTo.address}` : "To be shipped" : "Pickup",
+      order.contact ? `Contact: ${order.contact}` : null,
       `via ${CHANNELS[order.channel] ?? order.channel}`,
     ].filter(Boolean).join(" · ")),
     order.note ? el("p", { class: "order-note" }, `Note: ${order.note}`) : null,
+    order.quoteNote && !open ? el("p", { class: "muted" }, `You told them: ${order.quoteNote}`) : null,
+    open ? quoteForm(order, message) : null,
+    open ? el("div", { class: "row" },
+      el("p", { class: "muted" }, "Include any delivery in your price. The shopper pays it through PayPal from this link:"),
+      copyButton(() => `${location.origin}/quote/${slug}/${order.id}`, "Copy shopper link"),
+    ) : null,
     order.tracking ? el("p", { class: "muted" }, `Tracking: ${order.tracking.carrier} ${order.tracking.number}`) : null,
     paid ? el("div", { class: "row" },
       order.fulfillment === "ship" && !order.tracking ? el("form", {
@@ -133,7 +164,11 @@ async function refresh() {
   slots.revenue.textContent = data.stats.revenue;
   update("events", data.events, renderFeed);
   update("unmet", data.unmet, renderUnmet);
-  update("orders", data.orders, (orders) => slots.orderList.replaceChildren(...(orders.length ? orders.map(orderCard) : [el("p", { class: "muted" }, "Orders will appear here the moment a shopper starts one.")])));
+  // Replacing the list would wipe a price the owner is typing, so it waits until they leave the field.
+  if (!slots.orderList.contains(document.activeElement)) {
+    const needsPriceFirst = [...data.orders].sort((a, b) => (b.status === "awaiting_quote") - (a.status === "awaiting_quote"));
+    update("orders", needsPriceFirst, (orders) => slots.orderList.replaceChildren(...(orders.length ? orders.map(orderCard) : [el("p", { class: "muted" }, "Orders and price requests will appear here the moment a shopper starts one.")])));
+  }
   return true;
 }
 

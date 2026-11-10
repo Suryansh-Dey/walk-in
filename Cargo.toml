@@ -26,6 +26,7 @@ lambda_http = { version = "1", default-features = false, features = ["apigw_http
 lambda_runtime = "1"
 open-client = "1"
 mime_guess = "2"
+pdf-extract = "0.12"
 rand = "0.9"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }

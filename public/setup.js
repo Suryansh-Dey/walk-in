@@ -8,6 +8,9 @@ let status;
 let checklist;
 
 const flagged = () => shop.products.filter((product) => !product.priceVerified).length;
+const byQuote = () => shop.products.filter((product) => product.byQuote).length;
+// A blank price means shoppers ask the shop for one.
+const priceFrom = (input) => (input.value.trim() === "" ? null : Number(input.value));
 
 function setStatus(message, isError = false) {
   if (!status) return;
@@ -41,7 +44,7 @@ function renderProgress() {
     el("p", { class: "eyebrow" }, "One moment"),
     el("h1", {}, "Walking through your shop"),
     el("ol", { class: "progress" }, steps.map((step) => el("li", { class: step.done ? "is-done" : "is-active" }, step.label))),
-    el("p", { class: "muted" }, "This usually takes under a minute."),
+    el("p", { class: "muted" }, "This usually takes a minute or two."),
   ));
 }
 
@@ -49,8 +52,8 @@ function productRow(product) {
   const needsConfirming = !product.priceVerified;
   const name = el("input", { "aria-label": "Product name" });
   name.value = product.name;
-  const price = el("input", { type: "number", min: "0", step: "any", "aria-label": `Price in ${shop.currency}` });
-  price.value = product.price;
+  const price = el("input", { type: "number", min: "0", step: "any", placeholder: "By quote", "aria-label": `Price in ${shop.currency}, blank for by quote` });
+  price.value = product.byQuote ? "" : product.price;
   const category = el("input", { "aria-label": "Category", placeholder: "Category" });
   category.value = product.category;
   const inStock = el("input", { type: "checkbox" });
@@ -63,7 +66,7 @@ function productRow(product) {
       const saved = await api(`/api/shops/${slug}/products/${product.id}`, {
         method: "PUT",
         key,
-        body: { name: name.value, description: product.description, price: Number(price.value), category: category.value, inStock: inStock.checked },
+        body: { name: name.value, description: product.description, price: priceFrom(price), category: category.value, inStock: inStock.checked },
       });
       shop.products[shop.products.findIndex((entry) => entry.id === product.id)] = saved;
       row.replaceWith(productRow(saved));
@@ -87,6 +90,7 @@ function productRow(product) {
   row.append(...[
     el("div", { class: "product-fields" }, name, el("div", { class: "price-box" }, el("span", {}, shop.currency), price), category),
     needsConfirming ? el("p", { class: "flag" }, product.priceText ? `We read this as "${product.priceText}" and couldn't match it to a number on your page. Please check it.` : "We couldn't find this price on your page. Please check it.") : null,
+    product.byQuote ? el("p", { class: "muted" }, "No price on your site, so shoppers will ask you for one. Add a price to sell it directly.") : null,
     el("div", { class: "product-actions" },
       el("label", { class: "check" }, inStock, "In stock"),
       el("button", { type: "button", class: needsConfirming ? "button button-primary button-small" : "button button-quiet button-small", onclick: submit }, needsConfirming ? "Confirm price" : "Save"),
@@ -98,13 +102,13 @@ function productRow(product) {
 
 function addProductForm(list) {
   const name = el("input", { placeholder: "Product name", "aria-label": "New product name" });
-  const price = el("input", { type: "number", min: "0", step: "any", placeholder: "Price", "aria-label": "New product price" });
+  const price = el("input", { type: "number", min: "0", step: "any", placeholder: "By quote", "aria-label": "New product price, blank for by quote" });
   const form = el("form", {
     class: "add-product",
     onsubmit: async (event) => {
       event.preventDefault();
       try {
-        const created = await api(`/api/shops/${slug}/products`, { method: "POST", key, body: { name: name.value, price: Number(price.value) } });
+        const created = await api(`/api/shops/${slug}/products`, { method: "POST", key, body: { name: name.value, price: priceFrom(price) } });
         shop.products.push(created);
         list.append(productRow(created));
         form.reset();
@@ -181,9 +185,10 @@ function paypalBlock() {
 function renderChecklist() {
   if (!checklist) return;
   const count = flagged();
+  const quotes = byQuote();
   const needsOwnership = shop.publishNeedsVerification && !shop.verified;
   const items = [
-    [shop.products.length > 0, `${shop.products.length} ${shop.products.length === 1 ? "product" : "products"} found`],
+    [shop.products.length > 0, `${shop.products.length} ${shop.products.length === 1 ? "product" : "products"} found${quotes ? `, ${quotes} by quote` : ""}`],
     [count === 0, count === 0 ? "Every price checked" : `${count} ${count === 1 ? "price needs" : "prices need"} your eye`],
     [Boolean(shop.paypalEmail), shop.paypalEmail ? "PayPal connected" : "Connect PayPal"],
     [shop.ships || shop.pickup, shop.ships || shop.pickup ? "Delivery set" : "Offer shipping or pickup"],
@@ -225,7 +230,7 @@ function renderReview() {
       shop.warnings.length ? el("ul", { class: "warnings" }, shop.warnings.map((warning) => el("li", {}, warning))) : null,
       el("section", { class: "card" },
         el("h2", {}, "What you sell"),
-        el("p", { class: "muted" }, "Assistants can only quote these prices, so make sure they're right."),
+        el("p", { class: "muted" }, "Assistants can only use these prices, so make sure they're right. Leave a price blank and shoppers can ask you for one."),
         list,
         addProductForm(list),
       ),

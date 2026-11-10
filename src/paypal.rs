@@ -49,6 +49,8 @@ pub struct PayPal {
 
 pub struct CheckoutRequest<'a> {
     pub reference: &'a str,
+    /// Repeating a key returns the same PayPal order instead of creating another.
+    pub idempotency_key: String,
     /// Lets webhooks find the order without a secondary index.
     pub custom_id: &'a str,
     pub brand_name: &'a str,
@@ -215,7 +217,7 @@ impl PayPal {
         });
         let created = self
             .call(Method::POST, "/v2/checkout/orders", Some(body), &[
-                ("PayPal-Request-Id", format!("create-{}", request.reference)),
+                ("PayPal-Request-Id", request.idempotency_key),
                 ("Prefer", "return=representation".to_owned()),
             ])
             .await?;

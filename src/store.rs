@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use serde_dynamo::{from_item, to_attribute_value, to_item};
 
 use crate::config::Config;
-use crate::model::{Channel, Order, OrderStatus, Product, ShipTo, Shop, ShopEvent, Tracking, UnmetNeed, now};
+use crate::model::{Channel, Order, OrderItem, OrderStatus, Product, ShipTo, Shop, ShopEvent, Tracking, UnmetNeed, now};
 
 type Item = HashMap<String, AttributeValue>;
 
@@ -270,6 +270,42 @@ impl Store {
         let (partition, sort) = Self::order_key(order);
         self.set_fields(&partition, &sort, vec![("paypalOrderId", s(paypal_order_id)), ("approvalUrl", s(approval_url))], None).await?;
         Ok(())
+    }
+
+    /// Records the shop's price. Returns false if the request changed since it was read.
+    pub async fn set_quote(&self, order: &Order, items: &[OrderItem], total_minor: i64, note: Option<&str>) -> Result<bool> {
+        let (partition, sort) = Self::order_key(order);
+        self.set_fields(
+            &partition,
+            &sort,
+            vec![
+                ("status", s(OrderStatus::Quoted.as_str())),
+                ("items", to_attribute_value(items)?),
+                ("itemsMinor", n(total_minor)),
+                ("totalMinor", n(total_minor)),
+                ("quoteNote", to_attribute_value(note)?),
+            ],
+            Some(order.status.as_str()),
+        )
+        .await
+    }
+
+    /// Returns false if the request changed since it was read.
+    pub async fn decline_quote(&self, order: &Order, note: Option<&str>) -> Result<bool> {
+        let (partition, sort) = Self::order_key(order);
+        self.set_fields(&partition, &sort, vec![("status", s(OrderStatus::Declined.as_str())), ("quoteNote", to_attribute_value(note)?)], Some(order.status.as_str())).await
+    }
+
+    /// Moves a priced quote into checkout. Returns false if another request got there first.
+    pub async fn start_quote_checkout(&self, order: &Order, paypal_order_id: &str, approval_url: &str) -> Result<bool> {
+        let (partition, sort) = Self::order_key(order);
+        self.set_fields(
+            &partition,
+            &sort,
+            vec![("status", s(OrderStatus::AwaitingPayment.as_str())), ("paypalOrderId", s(paypal_order_id)), ("approvalUrl", s(approval_url))],
+            Some(OrderStatus::Quoted.as_str()),
+        )
+        .await
     }
 
     pub async fn set_order_status(&self, order: &Order, status: OrderStatus) -> Result<()> {

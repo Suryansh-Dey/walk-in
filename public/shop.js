@@ -22,11 +22,20 @@ function checkoutCard(checkout) {
   );
 }
 
+function quoteCard(quote) {
+  const url = safeUrl(quote.statusUrl);
+  return el("div", { class: "pay-card" },
+    el("div", {}, el("span", { class: "muted" }, `Request ${quote.orderReference}`), el("strong", {}, "Your price request")),
+    url ? el("a", { class: "button button-primary", href: url, target: "_blank", rel: "noopener" }, "Open request") : null,
+  );
+}
+
 function addAssistant(result) {
   const bubble = el("div", { class: "turn turn-assistant" },
     result.steps.length ? el("ul", { class: "tool-steps" }, result.steps.map((step) => el("li", { class: step.ok ? "chip chip-static" : "chip chip-static is-failed" }, step.title))) : null,
     el("p", { class: "bubble" }, result.reply),
     result.checkout ? checkoutCard(result.checkout) : null,
+    result.quote ? quoteCard(result.quote) : null,
   );
   log.append(bubble);
   scroll();
