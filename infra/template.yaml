@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Walk-In turns a small shop's website into a store AI assistants can buy from, paid through PayPal.
+
+Parameters:
+  ArtifactBucket:
+    Type: String
+  WebArtifactKey:
+    Type: String
+  ImporterArtifactKey:
+    Type: String
+  OpenRouterApiKey:
+    Type: String
+    NoEcho: true
+  OpenRouterModel:
+    Type: String
+    Default: deepseek/deepseek-v4.1-flash-1017
+  PayPalClientId:
+    Type: String
+    NoEcho: true
+  PayPalClientSecret:
+    Type: String
+    NoEcho: true
+  PayPalWebhookId:
+    Type: String
+    Default: ""
+  PayPalApiBase:
+    Type: String
+    Default: https://api-m.sandbox.paypal.com
+  DemoMerchantEmail:
+    Type: String
+    Default: ""
+  AllowUnverifiedPublish:
+    Type: String
+    Default: "0"
+    AllowedValues: ["0", "1"]
+  WebConcurrency:
+    Type: Number
+    Default: 20
+    Description: Reserved concurrency for the web function, which caps cost during a traffic spike. 0 means no cap.
+
+Conditions:
+  CapWebConcurrency: !Not [!Equals [!Ref WebConcurrency, 0]]
+
+Resources:
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  TableAccess:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+              - dynamodb:BatchWriteItem
+            Resource: !GetAtt Table.Arn
+
+  ImporterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref TableAccess
+
+  ImporterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      Handler: bootstrap
+      MemorySize: 512
+      # Long enough for the model's own retries, so a slow import fails with a message instead of hanging.
+      Timeout: 900
+      Role: !GetAtt ImporterRole.Arn
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref ImporterArtifactKey
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref Table
+          OPENROUTER_API_KEY: !Ref OpenRouterApiKey
+          OPENROUTER_MODEL: !Ref OpenRouterModel
+
+  ImporterRetries:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref ImporterFunction
+      Qualifier: $LATEST
+      MaximumRetryAttempts: 1
+
+  WebRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref TableAccess
+      Policies:
+        - PolicyName: start-imports
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ImporterFunction.Arn
+
+  WebFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: provided.al2023
+      Architectures: [arm64]
+      Handler: bootstrap
+      MemorySize: 512
+      Timeout: 180
+      Role: !GetAtt WebRole.Arn
+      ReservedConcurrentExecutions: !If [CapWebConcurrency, !Ref WebConcurrency, !Ref AWS::NoValue]
+      Code:
+        S3Bucket: !Ref ArtifactBucket
+        S3Key: !Ref WebArtifactKey
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref Table
+          IMPORTER_FUNCTION: !Ref ImporterFunction
+          OPENROUTER_API_KEY: !Ref OpenRouterApiKey
+          OPENROUTER_MODEL: !Ref OpenRouterModel
+          PAYPAL_CLIENT_ID: !Ref PayPalClientId
+          PAYPAL_CLIENT_SECRET: !Ref PayPalClientSecret
+          PAYPAL_WEBHOOK_ID: !Ref PayPalWebhookId
+          PAYPAL_API_BASE: !Ref PayPalApiBase
+          DEMO_MERCHANT_EMAIL: !Ref DemoMerchantEmail
+          ALLOW_UNVERIFIED_PUBLISH: !Ref AllowUnverifiedPublish
+
+  WebUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      InvokeMode: BUFFERED
+      TargetFunctionArn: !GetAtt WebFunction.Arn
+
+  # Function URLs need both of these statements, and the second only allows calls that arrive through the URL.
+  PublicUrlAccess:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebFunction
+      Action: lambda:InvokeFunctionUrl
+      FunctionUrlAuthType: NONE
+      Principal: "*"
+
+  PublicInvokeAccess:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebFunction
+      Action: lambda:InvokeFunction
+      InvokedViaFunctionUrl: true
+      Principal: "*"
+
+Outputs:
+  AppUrl:
+    Value: !GetAtt WebUrl.FunctionUrl
+  PayPalWebhookUrl:
+    Description: Register this in your PayPal app, then deploy again with PAYPAL_WEBHOOK_ID set.
+    Value: !Sub ${WebUrl.FunctionUrl}api/webhooks/paypal

@@ -1,0 +1,9 @@
+body{margin:0;font:17px/1.6 Georgia,serif;background:#fff8ef;color:#3a2a20}
+header{padding:28px 6vw 12px;border-bottom:3px double #b98a5a}
+.site{font-size:30px;margin:0;font-weight:bold}
+nav a{margin-right:18px;color:#8a4b1f}
+main{padding:24px 6vw;max-width:880px}
+.items{display:grid;gap:18px;grid-template-columns:repeat(auto-fill,minmax(250px,1fr))}
+.item{background:#fff;border:1px solid #e6d3bd;padding:14px 16px}
+.item h3{margin:0}.price{font-weight:bold;margin:4px 0}
+footer{padding:24px 6vw;color:#8b7768;font-size:14px}

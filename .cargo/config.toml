@@ -1,0 +1,4 @@
+# Lambda's arm64 runs on Graviton2 or newer. Setting this also stops a personal
+# `target-cpu=native` from applying the build machine's CPU to the cross-compile.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=neoverse-n1"]

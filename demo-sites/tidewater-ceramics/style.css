@@ -1,0 +1,9 @@
+body{margin:0;font:16px/1.65 'Trebuchet MS',Verdana,sans-serif;background:#eef5f4;color:#17343a}
+header{padding:26px 8vw;background:linear-gradient(120deg,#cfe6e2,#f4efe4)}
+.site{font-size:28px;letter-spacing:.04em;margin:0 0 8px}
+nav a{color:#0f5a63;margin-right:18px}
+main{padding:22px 8vw;max-width:900px}
+.items{display:grid;gap:16px;grid-template-columns:repeat(auto-fill,minmax(240px,1fr))}
+.item{background:#fff;border-radius:10px;padding:14px 16px}
+.item h3{margin:0}.price{font-weight:700;margin:4px 0}
+footer{padding:22px 8vw;font-size:13px;color:#587076}

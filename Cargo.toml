@@ -1,0 +1,55 @@
+[package]
+name = "walk-in"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Open any small shop to AI shoppers in a minute, with PayPal checkout."
+default-run = "web"
+
+[[bin]]
+name = "web"
+path = "src/bin/web.rs"
+
+[[bin]]
+name = "importer"
+path = "src/bin/importer.rs"
+
+[dependencies]
+anyhow = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-dynamodb = "1"
+aws-sdk-lambda = "1"
+axum = "0.8"
+ego-tree = "0.11"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+lambda_http = { version = "1", default-features = false, features = ["apigw_http", "tracing"] }
+lambda_runtime = "1"
+open-client = "1"
+mime_guess = "2"
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "form"] }
+rmcp = { version = "3", features = ["server", "transport-streamable-http-server"] }
+rust-embed = "8"
+schemars = "1"
+scraper = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_dynamo = { version = "4", features = ["aws-sdk-dynamodb+1"] }
+serde_json = "1"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["limit", "set-header", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
+[dev-dependencies]
+wiremock = "0.6"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 4
+strip = true
