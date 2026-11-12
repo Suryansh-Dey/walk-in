@@ -563,7 +563,7 @@ fn result_page(title: &str, inner: &str) -> Html<String> {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{title} · Walk-In</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Instrument+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap">
 <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body class="result-page"><main class="result-card">{inner}</main></body>
